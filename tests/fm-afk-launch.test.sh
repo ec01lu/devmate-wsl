@@ -1442,6 +1442,137 @@ unit_close_failure_preserves_record() {
   rm -rf "$st"
 }
 
+# After a VM or Herdr restart the daemon is gone but its recorded pane id can
+# be restored hosting this home's own firstmate session, whatever its harness
+# and whether or not Herdr registers it as an agent. Reconcile must leave such
+# a pane open and drop the record as already released, and must still close
+# the dead daemon's own pane - a lone idle shell in this home's daemon
+# workspace - by its exact id.
+# herdr_reconcile_case <state-dir> <agent-get-response> <foreground-name>
+#   [workspace-label] [foreground-cwd]: reconcile a herdr record for lab:w1:p7
+# against a fake Herdr CLI that logs every call to <state-dir>/herdr.log,
+# answers `agent get` with <agent-get-response>, reports <foreground-name> as
+# the pane's lone foreground process (pid 4242, also the shell pid) to `pane
+# process-info`, places the pane in workspace w1 labelled [workspace-label]
+# (default: a daemon label), and reports [foreground-cwd] (default: the home,
+# <state-dir>) as its live directory. A fake ps shows that pid sleeping with no
+# children.
+herdr_reconcile_case() {
+  local st=$1 agent=$2 foreground=$3 label=${4:-firstmate-afk-daemon-1-2-3} cwd=${5:-$1}
+  mkdir -p "$st/state" "$st/fakebin"
+  printf 'herdr\tlab:w1:p7\tw1\n' > "$st/state/.afk-daemon-terminal"
+  : > "$st/herdr.log"
+  cat > "$st/fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  "-axo pid=,ppid=") printf '%s\n' "    1     0" " 4242     1" ;;
+  "-axo pid=,ppid=,comm=") printf '%s\n' "    1     0 init" " 4242     1 $FOREGROUND" ;;
+  "-p 4242 -o stat=") printf '%s\n' "Ss" ;;
+  "-p 4242 -o comm=") printf '%s\n' "$FOREGROUND" ;;
+  "-p 4242 -o args=") printf '%s\n' "$FOREGROUND" ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$st/fakebin/ps"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" ST="$st" AGENT="$agent" FOREGROUND="$foreground" \
+    LABEL="$label" CWD="$cwd" \
+    FM_HERDR_PS_BIN="$st/fakebin/ps" FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 bash -c '
+    . "$1"
+    fm_backend_source herdr || exit 1
+    fm_backend_herdr_cli() {
+      shift
+      printf "%s\n" "$*" >> "$ST/herdr.log"
+      case "$1 $2" in
+        "pane get")
+          if [ -e "$ST/closed" ]; then
+            printf "%s" "{\"error\":{\"code\":\"pane_not_found\"}}"
+            return 1
+          fi
+          printf "{\"result\":{\"pane\":{\"pane_id\":\"w1:p7\",\"workspace_id\":\"w1\",\"foreground_cwd\":\"%s\"}}}" "$CWD"
+          ;;
+        "workspace list")
+          printf "{\"result\":{\"workspaces\":[{\"workspace_id\":\"w0\",\"label\":\"firstmate-afk-daemon-9-9-9\"},{\"workspace_id\":\"w1\",\"label\":\"%s\"}]}}" "$LABEL"
+          ;;
+        "agent get")
+          printf "%s" "$AGENT"
+          case "$AGENT" in *error*) return 1 ;; esac
+          ;;
+        "pane process-info")
+          printf "{\"result\":{\"type\":\"pane_process_info\",\"process_info\":{\"pane_id\":\"w1:p7\",\"shell_pid\":4242,\"foreground_process_group_id\":4242,\"foreground_processes\":[{\"pid\":4242,\"name\":\"%s\",\"argv\":[\"%s\"]}]}}}" "$FOREGROUND" "$FOREGROUND"
+          ;;
+        "pane close") : > "$ST/closed" ;;
+        *) return 2 ;;
+      esac
+    }
+    fm_afk_launch_reconcile
+  ' _ "$LAUNCH"
+}
+
+# assert_herdr_reconcile_leaves_pane_open <label> <agent-get-response>
+#   <foreground-name> [workspace-label] [foreground-cwd]
+assert_herdr_reconcile_leaves_pane_open() {
+  local label=$1 st rc=0
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-herdr-held-pane.XXXXXX")
+  herdr_reconcile_case "$st" "$2" "$3" "${4:-}" "${5:-}" || rc=$?
+  if [ "$rc" -eq 0 ] && ! grep -q '^pane close' "$st/herdr.log" && [ ! -e "$st/closed" ] \
+    && [ ! -e "$st/state/.afk-daemon-terminal" ]; then
+    pass "herdr reconcile: a recorded pane now holding $label is left open and its record released"
+  else
+    fail "herdr reconcile: closed a recorded pane holding $label, or kept its record (rc=$rc): $(cat "$st/herdr.log")"
+  fi
+  rm -rf "$st"
+}
+
+unit_herdr_reconcile_leaves_agent_pane_open() {
+  assert_herdr_reconcile_leaves_pane_open "a registered agent" \
+    '{"result":{"agent":{"agent_status":"working"}}}' claude
+}
+
+# Herdr registers no agent for some supported primary harnesses (for example
+# rovo, docs/verification/rovo.md), so an empty agent registry alone does not
+# make the pane the dead daemon's.
+unit_herdr_reconcile_leaves_unregistered_harness_pane_open() {
+  assert_herdr_reconcile_leaves_pane_open "a harness Herdr does not register" \
+    '{"error":{"code":"agent_not_found"}}' rovodev
+}
+
+# A restart also restores other panes as fresh idle shells, and the recorded id
+# can name one of them: this home's own pane before its session is relaunched,
+# or another home's dead daemon in a shared session. An idle shell alone does
+# not make the pane this home's daemon's.
+unit_herdr_reconcile_leaves_unrelated_idle_shell_open() {
+  assert_herdr_reconcile_leaves_pane_open "this home's own idle shell" \
+    '{"error":{"code":"agent_not_found"}}' bash firstmate
+  assert_herdr_reconcile_leaves_pane_open "another home's daemon idle shell" \
+    '{"error":{"code":"agent_not_found"}}' bash firstmate-afk-daemon-7-7-7 /tmp
+}
+
+unit_herdr_reconcile_closes_daemon_pane() {
+  local st rc=0
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-herdr-daemon-pane.XXXXXX")
+  herdr_reconcile_case "$st" '{"error":{"code":"agent_not_found"}}' bash || rc=$?
+  if [ "$rc" -eq 0 ] && grep -q '^pane close w1:p7$' "$st/herdr.log" \
+    && [ ! -e "$st/state/.afk-daemon-terminal" ]; then
+    pass "herdr reconcile: the dead daemon's idle-shell recorded pane is closed by exact id"
+  else
+    fail "herdr reconcile: the dead daemon's idle-shell recorded pane was not closed (rc=$rc): $(cat "$st/herdr.log")"
+  fi
+  rm -rf "$st"
+}
+
+unit_herdr_reconcile_preserves_unreadable_pane() {
+  local st rc=0
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-herdr-unreadable-pane.XXXXXX")
+  herdr_reconcile_case "$st" 'not-json' bash || rc=$?
+  if [ "$rc" -ne 0 ] && ! grep -q '^pane close' "$st/herdr.log" \
+    && [ -e "$st/state/.afk-daemon-terminal" ]; then
+    pass "herdr reconcile: a recorded pane whose occupant is unreadable is left open with its record preserved"
+  else
+    fail "herdr reconcile: acted on a recorded pane whose occupant is unreadable (rc=$rc): $(cat "$st/herdr.log")"
+  fi
+  rm -rf "$st"
+}
+
 unit_record_publication_atomic() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-record-atomic.XXXXXX")
@@ -1744,7 +1875,7 @@ e2e_herdr() {
   . "$ROOT/bin/fm-backend.sh"
 
   local SESSION home_tmp cap_ws cap_tab cap_pane target
-  local before during after ws_before ws_during ws_after out dtgt dtab
+  local before during after ws_before ws_during ws_after out dtgt dtab dpid
   SESSION="fm-lab-afk-launch-e2e-$$"
   export HERDR_SESSION="$SESSION"
   home_tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-e2e-home.XXXXXX")
@@ -1782,6 +1913,15 @@ e2e_herdr() {
   if [ "$ws_during" -gt "$ws_before" ]; then pass "herdr e2e: daemon launched in a separate non-visible workspace"; else fail "herdr e2e: no separate daemon workspace created"; fi
   if [ -n "$dtab" ] && [ "$dtab" != "$cap_tab" ]; then pass "herdr e2e: daemon pane is NOT in the captain's tab"; else fail "herdr e2e: daemon pane shares the captain tab ($dtab)"; fi
   case "$dtgt" in "$SESSION":*) pass "herdr e2e: daemon terminal scoped to the lab session" ;; *) fail "herdr e2e: daemon terminal not in the lab session ($dtgt)" ;; esac
+
+  # The stand-in daemon holds no daemon lock, so stop cannot end it the way it
+  # ends the real one; end it here first, leaving the daemon proven gone.
+  dpid=$(fm_backend_herdr_cli "$SESSION" pane process-info --pane "${dtgt#*:}" 2>/dev/null \
+    | jq -r '.result.process_info.foreground_processes[0].pid // empty')
+  if [ -n "$dpid" ]; then
+    kill -KILL "$dpid" 2>/dev/null || true
+    for _ in $(seq 1 40); do kill -0 "$dpid" 2>/dev/null || break; sleep 0.25; done
+  fi
 
   FM_HOME="$home_tmp" FM_STATE_OVERRIDE="$home_tmp/state" \
     FM_SUPERVISOR_TARGET="$target" FM_SUPERVISOR_BACKEND=herdr "$LAUNCH" stop >/dev/null 2>&1
@@ -1937,6 +2077,11 @@ unit_supervision_host_quiet_after_afk
 unit_supervision_host_quiet_failed_start
 unit_native_entry_preserves_prepared_state
 unit_close_failure_preserves_record
+unit_herdr_reconcile_leaves_agent_pane_open
+unit_herdr_reconcile_leaves_unregistered_harness_pane_open
+unit_herdr_reconcile_leaves_unrelated_idle_shell_open
+unit_herdr_reconcile_closes_daemon_pane
+unit_herdr_reconcile_preserves_unreadable_pane
 unit_record_publication_atomic
 unit_malformed_record_fails_closed
 unit_stop_malformed_record_fails_closed

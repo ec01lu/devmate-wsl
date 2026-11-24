@@ -301,6 +301,9 @@ The worker remains on the ordinary flat or Herdr-current-order path.
 
 Normal task metadata remains the sole endpoint authority after creation.
 Cleanup closes only the exact recorded task pane and never calls `workspace close`.
+A recorded pane id names a pane object, not its occupant: after a Herdr restart the same id can host something else, even this home's own firstmate session.
+So cleanup closes the recorded pane only while `fm_backend_herdr_pane_owner_state` proves its live foreground cwd is inside the task's copy (or a secondmate's home); a reassigned slot's occupant never counts as the recording task's.
+A pane proven held by another occupant is left open and the task's endpoint is treated as already released; an occupant that cannot be read refuses with every record retained.
 For a leased task copy, cleanup confirms that exact pane is gone before it reaps worktree processes or returns the copy.
 If the pane remains or its absence is ambiguous, cleanup retains the task records and copy for a retry.
 
@@ -355,11 +358,11 @@ Task cleanup acquires that session lock before the task's isolated copy is retur
 So a contended lock refuses up front while the copy, every durable record, and the endpoint are all intact for a plain rerun.
 
 Forced secondmate cleanup recursively preflights every Herdr child endpoint and acquires every affected named-session lock before mutating any child.
-It then retains each child's durable identity unless that exact pane returns structured not-found after its close.
+It then retains each child's durable identity unless that exact pane returns structured not-found after its close, or the occupant proof shows another occupant now holds it.
 
 ### When task records are erased
 
-Durable task records are erased only once the exact pane is confirmed gone through its structured presence.
+Durable task records are erased only once the exact pane is confirmed gone through its structured presence, or proven held by another occupant as [Cleanup and focus safety](#cleanup-and-focus-safety) describes.
 After every close path, only a structured not-found response counts as gone.
 A present or unknown result retains every record with a visible, retryable error.
 Missing or malformed endpoint identity and missing confirmation machinery are ambiguity, never proof of a gone pane, and refuse record removal the same way.
@@ -954,6 +957,7 @@ In that last case, `bin/fm-afk-launch.sh`:
 
 It never splits the captain's active tab and never uses shell `&`.
 Recovery reconciles only the recorded exact id.
+Once the daemon is proven not running (reconcile and stop), that recorded pane is closed only while it holds a lone idle shell with no registered agent in this home's daemon workspace; a pane any other occupant holds is left open and its record dropped as released, and an unreadable occupant keeps the record.
 
 ### Stopping the daemon
 

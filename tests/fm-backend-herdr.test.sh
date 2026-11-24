@@ -4232,6 +4232,84 @@ test_kill_is_best_effort() {
   pass "fm_backend_herdr_kill: calls pane close and stays best-effort on failure"
 }
 
+# A recorded pane id names a pane object, not its occupant: after a Herdr
+# restart it can host another session. Only a live foreground cwd inside the
+# owner's directory proves the task still occupies it.
+test_pane_owner_state_classifies_live_occupant() {
+  local dir out
+  dir="$TMP_ROOT/owner-state"; mkdir -p "$dir/copy/sub" "$dir/home" "$dir/copy-sibling"
+  ln -s "$dir/copy" "$dir/copy-link"
+  out=$(DIR="$dir" bash -c '
+    . "$0/bin/backends/herdr.sh"
+    fm_backend_herdr_cli() { printf "%s\n" "$FM_FAKE_PANE_GET"; return "${FM_FAKE_PANE_STATUS:-0}"; }
+    pane() { printf "{\"result\":{\"pane\":{\"pane_id\":\"%s\",\"foreground_cwd\":\"%s\"}}}" "$1" "$2"; }
+    check() {  # <label> <response> <status> <owner> <expected>
+      local got
+      got=$(FM_FAKE_PANE_GET=$2 FM_FAKE_PANE_STATUS=$3 fm_backend_herdr_pane_owner_state fmtest w2:p2 "$4")
+      [ "$got" = "$5" ] || printf "MISMATCH %s: got=%s expected=%s\n" "$1" "$got" "$5"
+    }
+    check exact "$(pane w2:p2 "$DIR/copy")" 0 "$DIR/copy" owned
+    check below "$(pane w2:p2 "$DIR/copy/sub")" 0 "$DIR/copy" owned
+    check owner-trailing-slash "$(pane w2:p2 "$DIR/copy/sub")" 0 "$DIR/copy/" owned
+    check symlinked-owner "$(pane w2:p2 "$DIR/copy/sub")" 0 "$DIR/copy-link" owned
+    check other-home "$(pane w2:p2 "$DIR/home")" 0 "$DIR/copy" foreign
+    check sibling-prefix "$(pane w2:p2 "$DIR/copy-sibling")" 0 "$DIR/copy" foreign
+    check deleted-cwd "$(pane w2:p2 "$DIR/copy (deleted)")" 0 "$DIR/copy" foreign
+    check other-pane "$(pane w2:p3 "$DIR/copy")" 0 "$DIR/copy" unknown
+    check no-foreground "{\"result\":{\"pane\":{\"pane_id\":\"w2:p2\"}}}" 0 "$DIR/copy" unknown
+    check relative-foreground "$(pane w2:p2 copy)" 0 "$DIR/copy" unknown
+    check no-owner "$(pane w2:p2 "$DIR/copy")" 0 "" unknown
+    check root-owner "$(pane w2:p2 "$DIR/copy")" 0 / unknown
+    check garbage "not-json" 0 "$DIR/copy" unknown
+    check not-found "{\"error\":{\"code\":\"pane_not_found\"}}" 1 "$DIR/copy" gone
+    check other-error "{\"error\":{\"code\":\"internal\"}}" 1 "$DIR/copy" unknown
+  ' "$ROOT" 2>&1)
+  [ -z "$out" ] || fail "pane owner state matrix mismatch: $out"
+  pass "fm_backend_herdr_pane_owner_state: only a live foreground cwd inside the owner's directory proves occupancy"
+}
+
+# kill_owner_case <dir> <pane-get-response>: run fm_backend_herdr_kill against
+# a recorded pane whose `pane get` returns <pane-get-response>, with the task's
+# copy as the owner proof; sets KILL_OWNER_RC.
+kill_owner_case() {
+  local dir=$1 response=$2 log resp fb
+  mkdir -p "$dir/responses" "$dir/copy" "$dir/firstmate-home"
+  log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '%s\n' "$response" > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  KILL_OWNER_RC=0
+  PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '
+      . "$0/bin/backends/herdr.sh"
+      fm_backend_herdr_target_ready() { fm_backend_herdr_parse_target "$1"; }
+      fm_backend_herdr_presentation_session_lock_path() { printf "/tmp/fm-herdr-test-lock"; }
+      fm_lock_try_acquire() { return 0; }
+      fm_lock_release() { return 0; }
+      fm_backend_herdr_kill default:w1:p2 "" "" "$1"
+    ' "$ROOT" "$dir/copy" 2> "$dir/stderr" || KILL_OWNER_RC=$?
+}
+
+test_kill_leaves_unowned_recorded_pane_open() {
+  local dir="$TMP_ROOT/kill-owner"
+  kill_owner_case "$dir" "{\"result\":{\"pane\":{\"pane_id\":\"w1:p2\",\"tab_id\":\"w1:t2\",\"workspace_id\":\"w1\",\"foreground_cwd\":\"$dir/firstmate-home\"}}}"
+  expect_code 0 "$KILL_OWNER_RC" "kill of a released endpoint must stay best-effort"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''pane'$'\x1f''close' "kill closed a recorded pane another occupant now holds"
+  assert_contains "$(cat "$dir/stderr")" "now held by an occupant outside $dir/copy" "leaving the pane open was not explained as a foreign occupant"
+  pass "fm_backend_herdr_kill: leaves a recorded pane open when its live occupant is not the owner"
+}
+
+# An unreadable occupant proves neither ownership nor release, so the pane
+# stays open and the kill reports failure: a caller must not replace or forget
+# an endpoint that may still be the task's.
+test_kill_refuses_unreadable_recorded_pane_occupant() {
+  local dir="$TMP_ROOT/kill-owner-unknown"
+  kill_owner_case "$dir" '{"result":{"pane":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"}}}'
+  [ "$KILL_OWNER_RC" -ne 0 ] || fail "kill reported success for a recorded pane whose occupant it could not read"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''pane'$'\x1f''close' "kill closed a recorded pane whose occupant it could not read"
+  assert_contains "$(cat "$dir/stderr")" "could not be proven to be the task in $dir/copy (unknown)" "the unproven occupant was not explained"
+  pass "fm_backend_herdr_kill: leaves a recorded pane with an unreadable occupant open and reports failure"
+}
+
 test_current_path_reads_cwd() {
   local dir log resp fb out
   dir="$TMP_ROOT/cwd"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -6655,6 +6733,9 @@ test_projection_close_failed_removal_rolls_back_the_reposition
 test_kill_emptying_non_focused_uses_pane_death
 test_kill_focused_workspace_stays_plain_close
 test_endpoint_confirmed_gone_gates_on_structured_presence
+test_pane_owner_state_classifies_live_occupant
+test_kill_leaves_unowned_recorded_pane_open
+test_kill_refuses_unreadable_recorded_pane_occupant
 test_kill_refuses_when_presentation_lock_is_unavailable
 test_projection_seeded_prune_refuses_active_tab
 test_projection_label_builder_uses_corner_and_strips_owner_prefixes

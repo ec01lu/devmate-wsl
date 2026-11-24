@@ -1336,9 +1336,12 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
 # inventory cannot be read, Orca reports a close its missing CLI never
 # attempted, and the remaining arms still report 0 for a close command that
 # failed after being accepted.
+# Herdr takes an optional fourth argument, the recording task's own directory,
+# and closes a recorded pane only while its live occupant is proven to be that
+# task (fm_backend_herdr_kill); the other adapters ignore that slot.
 # docs/verification/runtime-backends.md "Endpoint close" is the per-backend
 # record.
-fm_backend_kill() {  # <backend> <target>
+fm_backend_kill() {  # <backend> <target> [tab-id] [expected-label] [owner-dir]
   local backend=$1
   shift
   [ -n "${1:-}" ] || { echo "error: refusing empty backend kill target" >&2; return 1; }

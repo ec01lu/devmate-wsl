@@ -285,7 +285,9 @@ cmd_launch() {
         return 0
         ;;
       dead)
-        fm_backend_kill "$REMOTE_ENDPOINT_BACKEND" "$REMOTE_ENDPOINT_TARGET" 2>/dev/null \
+        # The home is Herdr's occupant proof for a recorded pane id
+        # (fm_backend_herdr_kill); the other adapters ignore that slot.
+        fm_backend_kill "$REMOTE_ENDPOINT_BACKEND" "$REMOTE_ENDPOINT_TARGET" "" "" "$TARGET_HOME" 2>/dev/null \
           || die "could not remove the confirmed agent-less endpoint"
         ;;
       missing) ;;

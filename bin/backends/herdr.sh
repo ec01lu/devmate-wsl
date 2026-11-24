@@ -2153,6 +2153,42 @@ fm_backend_herdr_pane_presence_state() {  # <session> <pane_id>
   [ "$pid" = "$pane_id" ] && printf 'present' || printf 'unknown'
 }
 
+# fm_backend_herdr_pane_owner_state: whether a recorded pane is still occupied
+# by the task that recorded it, as one of owned|foreign|unknown|gone.
+# A Herdr pane id names a pane object, not its occupant: after a server restart
+# Herdr restores a task's pane under the same id (and can resume its agent), and
+# whatever is started in that pane afterward - including a firstmate session -
+# inherits the task's recorded id. The live foreground process's cwd is the
+# occupant signal; the creation-time `cwd` field is not (see
+# fm_backend_herdr_current_path).
+#   owned   - foreground_cwd is <owner-dir> or below it
+#   foreign - foreground_cwd is readable and outside <owner-dir>
+#   unknown - no owner directory, an unreadable or mismatched response, or no
+#             absolute foreground_cwd
+#   gone    - a structured pane_not_found
+# Only owned authorizes closing the pane for that task.
+fm_backend_herdr_pane_owner_state() {  # <session> <pane_id> <owner-dir>
+  local session=$1 pane_id=$2 owner=${3:-} out code reported fg owner_real fg_real
+  out=$(fm_backend_herdr_cli "$session" pane get "$pane_id" 2>&1)
+  code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null)
+  if [ -n "$code" ]; then
+    [ "$code" = pane_not_found ] && printf 'gone' || printf 'unknown'
+    return 0
+  fi
+  reported=$(printf '%s' "$out" | jq -r '.result.pane.pane_id // empty' 2>/dev/null)
+  fg=$(printf '%s' "$out" | jq -r '.result.pane.foreground_cwd // empty' 2>/dev/null)
+  case "$owner" in /*) ;; *) printf 'unknown'; return 0 ;; esac
+  case "$fg" in /*) ;; *) printf 'unknown'; return 0 ;; esac
+  [ "$reported" = "$pane_id" ] || { printf 'unknown'; return 0; }
+  owner_real=$(cd "$owner" 2>/dev/null && pwd -P) || owner_real=${owner%/}
+  fg_real=$(cd "$fg" 2>/dev/null && pwd -P) || fg_real=${fg%/}
+  case "$owner_real" in ''|/) printf 'unknown'; return 0 ;; esac
+  case "$fg_real/" in
+    "$owner_real"/*) printf 'owned' ;;
+    *) printf 'foreign' ;;
+  esac
+}
+
 fm_backend_herdr_workspace_presence_state() {  # <session> <workspace_id>
   local session=$1 workspace_id=$2 out matches
   out=$(fm_backend_herdr_cli "$session" workspace list 2>&1)
@@ -3706,9 +3742,31 @@ fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep>
 # restore as the backstop. A close that empties the FOCUSED workspace moves
 # focus legitimately, and every in-lock planning ambiguity or failure falls
 # back to the plain close, matching the pre-hardening contract.
-fm_backend_herdr_kill_serialized() {  # <session> <pane>
-  local session=$1 pane=$2
-  local before active_tab info target_pane target_tab target_ws plan shell_pid plan_move_record close_failed workspace_presence
+# With <owner-dir> (the recording task's isolated copy, or a secondmate's home),
+# the pane is closed only while fm_backend_herdr_pane_owner_state proves it
+# owned. A proven foreign occupant is left open and the call returns 3, meaning
+# the task's endpoint is already released; an unknown occupant is also left
+# open but returns 1, because nothing proves the task's pane released. Every
+# caller acting on a RECORDED endpoint passes it; only a caller closing a pane
+# it created itself omits it.
+fm_backend_herdr_kill_serialized() {  # <session> <pane> [owner-dir]
+  local session=$1 pane=$2 owner=${3:-}
+  local before active_tab info target_pane target_tab target_ws plan shell_pid plan_move_record close_failed workspace_presence owner_state
+  if [ -n "$owner" ]; then
+    owner_state=$(fm_backend_herdr_pane_owner_state "$session" "$pane" "$owner")
+    case "$owner_state" in
+      owned) ;;
+      gone) return 0 ;;
+      foreign)
+        echo "warning: herdr pane $session:$pane is now held by an occupant outside $owner; leaving it open and treating the task's endpoint as already gone" >&2
+        return 3
+        ;;
+      *)
+        echo "warning: herdr pane $session:$pane occupant could not be proven to be the task in $owner ($owner_state); leaving it open and not treating the task's endpoint as released" >&2
+        return 1
+        ;;
+    esac
+  fi
   before=$(fm_backend_herdr_projection_focus_snapshot "$session") || before=
   if [ -n "$before" ]; then
     active_tab=${before#*$'\t'}
@@ -3755,10 +3813,14 @@ fm_backend_herdr_kill_serialized() {  # <session> <pane>
   fm_backend_herdr_explicit_close_pane_confirmed "$session" "$pane" || true
 }
 
-fm_backend_herdr_kill() {  # <target>
+# fm_backend_herdr_kill: <owner-dir> carries fm_backend_herdr_kill_serialized's
+# occupant proof; the two middle arguments are the shared fm_backend_kill slots
+# other adapters use and Herdr ignores. A released endpoint still returns 0; an
+# occupant the proof could not read returns 1 with the pane left open.
+fm_backend_herdr_kill() {  # <target> [unused] [unused-label] [owner-dir]
   fm_backend_herdr_target_ready "$1" || return 0
-  local session=$FM_BACKEND_HERDR_SESSION pane=$FM_BACKEND_HERDR_PANE
-  local lock_path attempt=0 lock_held=0
+  local session=$FM_BACKEND_HERDR_SESSION pane=$FM_BACKEND_HERDR_PANE owner=${4:-}
+  local lock_path attempt=0 lock_held=0 kill_rc=0
   if ! declare -F fm_lock_try_acquire >/dev/null 2>&1; then
     # shellcheck source=bin/fm-wake-lib.sh
     . "$FM_BACKEND_HERDR_ROOT/bin/fm-wake-lib.sh"
@@ -3774,8 +3836,10 @@ fm_backend_herdr_kill() {  # <target>
     done
   fi
   if [ "$lock_held" = 1 ]; then
-    fm_backend_herdr_kill_serialized "$session" "$pane"
+    fm_backend_herdr_kill_serialized "$session" "$pane" "$owner" || kill_rc=$?
     fm_lock_release "$lock_path" || true
+    [ "$kill_rc" = 3 ] && kill_rc=0
+    return "$kill_rc"
   else
     echo "warning: herdr task kill could not acquire its session presentation lock; refusing an unlocked pane close" >&2
   fi

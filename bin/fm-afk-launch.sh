@@ -515,8 +515,72 @@ fm_afk_launch_terminal_absent() {  # <backend> <target>
   esac
 }
 
-fm_afk_launch_close_recorded() {
+# fm_afk_launch_herdr_pane_in_home_daemon_workspace: true only while the pane
+# sits in a daemon workspace (its label carries FM_AFK_LAUNCH_WS_LABEL, which
+# Herdr keeps across a restore) and its live working directory is inside this
+# home, where fm_afk_launch_create_herdr starts the daemon workspace. The label
+# alone matches another home's daemon in a shared session; the directory alone
+# matches this home's own pane.
+fm_afk_launch_herdr_pane_in_home_daemon_workspace() {  # <session> <pane>
+  local session=$1 pane=$2 wsid label
+  [ "$(fm_backend_herdr_pane_owner_state "$session" "$pane" "$FM_HOME")" = owned ] || return 1
+  wsid=$(fm_backend_herdr_cli "$session" pane get "$pane" 2>/dev/null \
+    | jq -r '.result.pane.workspace_id // empty' 2>/dev/null)
+  [ -n "$wsid" ] || return 1
+  label=$(fm_backend_herdr_cli "$session" workspace list 2>/dev/null \
+    | jq -r --arg ws "$wsid" '.result.workspaces[]? | select(.workspace_id == $ws) | .label' 2>/dev/null)
+  case "$label" in
+    "$FM_AFK_LAUNCH_WS_LABEL"-*) return 0 ;;
+  esac
+  return 1
+}
+
+# fm_afk_launch_herdr_recorded_pane_state: who holds a recorded daemon pane
+# once its daemon is gone, as one of gone|idle|held|unknown. A Herdr pane id
+# names a pane object, not its occupant: after a Herdr restart the recorded id
+# can host this home's own firstmate session, whatever its harness and whether
+# or not Herdr registers it as an agent, or some other restored pane's idle
+# shell. A dead daemon leaves at most a lone idle shell
+# (fm_backend_herdr_pane_idle_shell_pid) in this home's daemon workspace, so
+# only that is closable; any other readable occupant holds the pane now.
+fm_afk_launch_herdr_recorded_pane_state() {  # <target>
+  local session=${1%%:*} pane=${1#*:}
+  fm_backend_source herdr || { printf 'unknown'; return 0; }
+  case "$(fm_backend_herdr_pane_agent_state "$session" "$pane")" in
+    dead) printf 'gone' ;;
+    no-agent)
+      if fm_backend_herdr_pane_idle_shell_pid "$session" "$pane" >/dev/null \
+        && fm_afk_launch_herdr_pane_in_home_daemon_workspace "$session" "$pane"; then
+        printf 'idle'
+      else
+        printf 'held'
+      fi
+      ;;
+    live|stale-agent) printf 'held' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# fm_afk_launch_close_recorded [daemon-gone]: close the recorded terminal by
+# exact id and drop its record once absence is confirmed. With daemon-gone
+# (reconcile and stop, after the daemon is proven not running) a Herdr pane is
+# closed only while it holds no more than the dead daemon's idle shell; a pane
+# another occupant holds is left open and its record dropped as released.
+fm_afk_launch_close_recorded() {  # [daemon-gone]
   local close_result=0
+  if [ "${1:-}" = daemon-gone ] && [ "$FM_AFK_REC_BACKEND" = herdr ]; then
+    case "$(fm_afk_launch_herdr_recorded_pane_state "$FM_AFK_REC_TARGET")" in
+      held)
+        rm -f "$FM_AFK_LAUNCH_RECORD" || return 1
+        fm_afk_launch_log "recorded herdr pane $FM_AFK_REC_TARGET is held by another occupant; leaving it open and dropping its record as already released"
+        return 0
+        ;;
+      unknown)
+        fm_afk_launch_log "recorded herdr pane $FM_AFK_REC_TARGET has an unreadable occupant; preserving exact id"
+        return 1
+        ;;
+    esac
+  fi
   fm_afk_launch_close_terminal "$FM_AFK_REC_BACKEND" "$FM_AFK_REC_TARGET" "${FM_AFK_REC_EXTRA:-}" || close_result=$?
   if fm_afk_launch_terminal_absent "$FM_AFK_REC_BACKEND" "$FM_AFK_REC_TARGET"; then
     rm -f "$FM_AFK_LAUNCH_RECORD" || return 1
@@ -620,7 +684,7 @@ fm_afk_launch_reconcile() {
   read_result=$?
   if [ "$read_result" -eq 0 ]; then
     fm_afk_launch_log "reconciling leaked daemon terminal ${FM_AFK_REC_BACKEND}:${FM_AFK_REC_TARGET}"
-    fm_afk_launch_close_recorded
+    fm_afk_launch_close_recorded daemon-gone
   elif [ "$read_result" -eq 2 ]; then
     return 1
   fi
@@ -932,7 +996,7 @@ fm_afk_launch_stop() {
     if [ "$FM_AFK_REC_BACKEND" != none ]; then
       closed_daemon_terminal=1
     fi
-    fm_afk_launch_close_recorded || result=1
+    fm_afk_launch_close_recorded daemon-gone || result=1
     [ "$result" -eq 0 ] || closed_daemon_terminal=0
   fi
   # (3) Clear the away-mode flag, then (4) archive the posture record LAST so the

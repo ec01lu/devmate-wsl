@@ -379,7 +379,7 @@ The refusal is reached only through a close that could not do its job, and each 
 | zellij | 0, silent | 0, not yet distinguishable |
 | cmux | 0, silent | 0, not yet distinguishable |
 | tern | 0, silent | 1 when its inventory re-read cannot run, the block moved to another session, its tab no longer carries the task's scoped title, or it is still listed after the close; portable fixtures only (`tests/fm-backend-tern.test.sh`), contract in [tern-backend.md](../tern-backend.md) |
-| herdr | 0, silent | 0 from this arm; `bin/fm-teardown.sh` gates every Herdr record removal on `fm_backend_herdr_endpoint_confirmed_gone` instead |
+| herdr | 0, silent | 0 from this arm, or 1 when a caller passes the task's directory and `fm_backend_herdr_pane_owner_state` cannot read the pane's occupant; `bin/fm-teardown.sh` gates Herdr record removal on `fm_backend_herdr_endpoint_confirmed_gone` instead, except for a recorded pane that `fm_backend_herdr_pane_owner_state` proves another occupant now holds, which it leaves open as an already-released endpoint, while an unreadable occupant refuses with every record retained (`tests/fm-teardown.test.sh`) |
 
 The three arms that still report 0 need a presence re-read taken after their own close, and the close-then-read timing that re-read depends on cannot be established without the real Zellij, Orca, and cmux binaries.
 Guessing it is what a refusal must never rest on: a gate that refused an already-exited session would break ordinary cleanup on every task, which is a worse failure than the stranded endpoint it would be trying to prevent.

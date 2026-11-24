@@ -3583,7 +3583,14 @@ case "\${1:-} \${2:-}" in
       printf '%s\n' '{"error":{"code":"pane_not_found"}}' >&2
       exit 1
     fi
-    printf '%s\n' '{"result":{"pane":{"pane_id":"wG:pQ","tab_id":"wG:tQ","workspace_id":"wG"}}}'
+    # The live occupant defaults to the task itself, inside its isolated copy;
+    # FM_FAKE_HERDR_FOREGROUND_CWD moves it elsewhere, and "none" omits it.
+    fg=\${FM_FAKE_HERDR_FOREGROUND_CWD:-$case_dir/wt}
+    if [ "\$fg" = none ]; then
+      printf '%s\n' '{"result":{"pane":{"pane_id":"wG:pQ","tab_id":"wG:tQ","workspace_id":"wG"}}}'
+    else
+      printf '{"result":{"pane":{"pane_id":"wG:pQ","tab_id":"wG:tQ","workspace_id":"wG","foreground_cwd":"%s"}}}\n' "\$fg"
+    fi
     ;;
   "agent get")
     printf '%s\n' '{"error":{"code":"agent_not_found"}}' >&2
@@ -3667,6 +3674,99 @@ SH
   grep -q "teardown task-x1 complete" "$case_dir/stdout2" \
     || fail "herdr-orphan-refusal: the successful retry did not report completion"
   pass "herdr flat teardown refuses before returning the isolated copy under lock contention and the retry completes cleanly"
+}
+
+# A Herdr restart can leave a finished task's recorded pane id hosting another
+# occupant, such as this home's own firstmate session. Teardown must leave that
+# pane open and still finish the task's cleanup, because the endpoint the task
+# recorded is already gone.
+assert_herdr_teardown_leaves_foreign_occupant_open() {  # <label> <foreground-cwd>
+  local label=$1 foreground=$2 case_dir log closed thlog
+  case_dir=$(make_case "herdr-occupant-$label")
+  write_meta "$case_dir" local-only ship
+  configure_flat_herdr_teardown_case "$case_dir"
+  log="$case_dir/herdr.log"; : > "$log"
+  closed="$case_dir/closed"
+  : > "$case_dir/state/task-x1.status"
+  thlog="$case_dir/treehouse.log"; : > "$thlog"
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$thlog"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+  [ "$foreground" = none ] || mkdir -p "$foreground"
+  FM_FAKE_HERDR_LOG="$log" FM_FAKE_HERDR_CLOSED="$closed" FM_FAKE_HERDR_FOREGROUND_CWD="$foreground" \
+    FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" \
+    || fail "herdr-occupant-$label: teardown of a released endpoint failed: $(cat "$case_dir/stderr")"
+  [ ! -e "$closed" ] || fail "herdr-occupant-$label: teardown closed a pane its task no longer occupies"
+  if grep -q "^pane close" "$log"; then
+    fail "herdr-occupant-$label: teardown issued a pane close for a pane its task no longer occupies"
+  fi
+  assert_grep "now held by an occupant that is not task-x1" "$case_dir/stderr" \
+    "herdr-occupant-$label: leaving the pane open was not explained visibly"
+  [ -s "$thlog" ] || fail "herdr-occupant-$label: cleanup stopped before returning the isolated copy"
+  [ ! -e "$case_dir/state/task-x1.meta" ] || fail "herdr-occupant-$label: cleanup left the metadata behind"
+  grep -q "teardown task-x1 complete" "$case_dir/stdout" \
+    || fail "herdr-occupant-$label: cleanup did not report completion"
+}
+
+test_herdr_flat_teardown_leaves_foreign_occupant_open() {
+  assert_herdr_teardown_leaves_foreign_occupant_open foreign "$TMP_ROOT/herdr-occupant-firstmate-home"
+  pass "herdr flat teardown leaves a recorded pane another occupant now holds open, and still finishes cleanup"
+}
+
+# A present pane whose occupant Herdr does not report proves neither that the
+# task still holds it nor that it was released, so teardown must neither close
+# it nor drop the records that name it: the reaper would otherwise end the
+# task's own pane shell outside the locked close.
+test_herdr_flat_teardown_refuses_unreadable_occupant() {
+  local case_dir log closed thlog rc=0
+  case_dir=$(make_case herdr-occupant-unreadable)
+  write_meta "$case_dir" local-only ship
+  configure_flat_herdr_teardown_case "$case_dir"
+  log="$case_dir/herdr.log"; : > "$log"
+  closed="$case_dir/closed"
+  : > "$case_dir/state/task-x1.status"
+  thlog="$case_dir/treehouse.log"; : > "$thlog"
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$thlog"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+  FM_FAKE_HERDR_LOG="$log" FM_FAKE_HERDR_CLOSED="$closed" FM_FAKE_HERDR_FOREGROUND_CWD=none \
+    FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  [ "$rc" -eq 1 ] || fail "herdr-occupant-unreadable: teardown exited $rc, not 1, for a pane whose occupant is unreadable: $(cat "$case_dir/stderr")"
+  [ ! -e "$closed" ] || fail "herdr-occupant-unreadable: teardown closed a pane whose occupant it could not prove"
+  if grep -q "^pane close" "$log"; then
+    fail "herdr-occupant-unreadable: teardown issued a pane close for a pane whose occupant it could not prove"
+  fi
+  [ -e "$case_dir/state/task-x1.meta" ] || fail "herdr-occupant-unreadable: teardown dropped the record naming a pane it could not prove released"
+  [ ! -s "$thlog" ] || fail "herdr-occupant-unreadable: teardown returned the isolated copy while the pane's occupant was unproven"
+  [ -d "$case_dir/wt" ] || fail "herdr-occupant-unreadable: teardown removed the isolated copy while the pane's occupant was unproven"
+  assert_grep "occupant could not be proven to be task-x1" "$case_dir/stderr" \
+    "herdr-occupant-unreadable: the refusal was not explained visibly"
+  pass "herdr flat teardown refuses, with the pane open and every record retained, when the recorded pane's occupant cannot be read"
+}
+
+test_herdr_flat_teardown_closes_occupant_below_its_copy() {
+  local case_dir log closed
+  case_dir=$(make_case herdr-occupant-owned)
+  write_meta "$case_dir" local-only ship
+  configure_flat_herdr_teardown_case "$case_dir"
+  log="$case_dir/herdr.log"; : > "$log"
+  closed="$case_dir/closed"
+  : > "$case_dir/state/task-x1.status"
+  mkdir -p "$case_dir/wt/sub/dir"
+  FM_FAKE_HERDR_LOG="$log" FM_FAKE_HERDR_CLOSED="$closed" FM_FAKE_HERDR_FOREGROUND_CWD="$case_dir/wt/sub/dir" \
+    FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS=1 \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" \
+    || fail "herdr-occupant-owned: teardown failed: $(cat "$case_dir/stderr")"
+  [ -e "$closed" ] || fail "herdr-occupant-owned: teardown left open a pane its task still occupies below its copy"
+  pass "herdr flat teardown still closes a pane whose live occupant works below the task's copy"
 }
 
 test_herdr_flat_teardown_refuses_records_on_unparseable_presence() {
@@ -3939,7 +4039,7 @@ case "\${1:-} \${2:-}" in
         exit 1
       fi
     else
-      printf '%s\n' '{"result":{"pane":{"pane_id":"wC:p1","tab_id":"wC:t1","workspace_id":"wC"}}}'
+      printf '%s\n' '{"result":{"pane":{"pane_id":"wC:p1","tab_id":"wC:t1","workspace_id":"wC","foreground_cwd":"$case_dir/wt"}}}'
     fi
     ;;
   "pane close") : > "\${FM_FAKE_HERDR_CLOSED:?}" ;;
@@ -4092,6 +4192,39 @@ test_forced_secondmate_herdr_child_retains_records_when_close_unconfirmed() {
   pass "forced secondmate teardown retains Herdr child identity until exact pane disappearance"
 }
 
+# A child whose pool slot another task has since claimed: after a Herdr
+# restart that task's pane can carry the child's recorded pane id while working
+# inside the same slot. Its occupant is the claimant's, so forced cleanup must
+# leave the pane open and still retire the child's own records.
+test_forced_secondmate_herdr_child_leaves_reassigned_slot_occupant_open() {
+  local case_dir home log closed slot rc=0
+  case_dir=$(make_case herdr-child-reassigned-slot)
+  write_meta "$case_dir" local-only secondmate
+  configure_secondmate_with_herdr_child "$case_dir"
+  home="$case_dir/secondmate-home"
+  log="$case_dir/herdr.log"; closed="$case_dir/closed"; : > "$log"
+  mkdir -p "$case_dir/pool/1"
+  git -C "$case_dir/project" worktree add -q --detach "$case_dir/pool/1/project"
+  slot="$case_dir/pool/1/project"
+  printf '{"worktrees":[{"name":"1","path":"%s"}]}\n' "$slot" > "$case_dir/pool/treehouse-state.json"
+  printf 'task=%s\nhome=%s\n' claimant-task "$case_dir/claimant-home" > "$case_dir/pool/1/.fm-slot-owner"
+  sed -i.bak "s|^worktree=.*|worktree=$slot|" "$home/state/child-herdr.meta"
+  sed -i.bak "s|\"foreground_cwd\":\"$case_dir/wt\"|\"foreground_cwd\":\"$slot\"|" "$case_dir/fakebin/herdr"
+  rm -f "$home/state/child-herdr.meta.bak" "$case_dir/fakebin/herdr.bak"
+  FM_FAKE_HERDR_LOG="$log" FM_FAKE_HERDR_CLOSED="$closed" \
+    run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  [ ! -e "$closed" ] || fail "herdr-child-reassigned-slot: forced cleanup closed the pane of the task that now holds the child's slot"
+  if grep -q "^pane close" "$log"; then
+    fail "herdr-child-reassigned-slot: forced cleanup issued a pane close for the slot claimant's pane"
+  fi
+  expect_code 0 "$rc" "herdr-child-reassigned-slot: forced cleanup should finish once the child's endpoint is released"
+  [ ! -e "$home/state/child-herdr.meta" ] || fail "herdr-child-reassigned-slot: the child's own record was retained"
+  [ -e "$slot/.git" ] || fail "herdr-child-reassigned-slot: the claimant's slot copy was removed"
+  assert_grep "task=claimant-task" "$case_dir/pool/1/.fm-slot-owner" \
+    "herdr-child-reassigned-slot: the claimant's slot claim was changed"
+  pass "forced secondmate teardown leaves a Herdr child's pane open when its slot now belongs to another task"
+}
+
 configure_nested_secondmate_with_herdr_grandchild() {  # <case-dir>
   local case_dir=$1 home="$1/secondmate-home" nested_home="$1/secondmate-home/nested-home"
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
@@ -4134,7 +4267,7 @@ case "\${1:-} \${2:-}" in
     if [ -e "\${FM_FAKE_HERDR_CLOSED:?}" ]; then
       printf '%s\n' 'not-json'
     else
-      printf '%s\n' '{"result":{"pane":{"pane_id":"wG:p1","tab_id":"wG:t1","workspace_id":"wG"}}}'
+      printf '%s\n' '{"result":{"pane":{"pane_id":"wG:p1","tab_id":"wG:t1","workspace_id":"wG","foreground_cwd":"$case_dir/wt"}}}'
     fi
     ;;
   "pane close") : > "\${FM_FAKE_HERDR_CLOSED:?}" ;;
@@ -4226,7 +4359,7 @@ case "${1:-} ${2:-}" in
       printf '%s\n' '{"error":{"code":"pane_not_found"}}' >&2
       exit 1
     fi
-    printf '%s\n' '{"result":{"pane":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"}}}'
+    printf '%s\n' '{"result":{"pane":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","foreground_cwd":"@TASK_COPY@"}}}'
     ;;
   "tab get")
     printf '%s\n' '{"result":{"tab":{"tab_id":"w2:t2","workspace_id":"w2"}}}'
@@ -4244,6 +4377,9 @@ case "${1:-} ${2:-}" in
     ;;
 esac
 SH
+  # The live occupant is the task itself, inside its isolated copy.
+  sed -i.bak "s|@TASK_COPY@|$case_dir/wt|" "$case_dir/fakebin/herdr"
+  rm -f "$case_dir/fakebin/herdr.bak"
   chmod +x "$case_dir/fakebin/herdr"
 }
 
@@ -6624,12 +6760,16 @@ test_teardown_preserves_ignored_project_polytoken_layer
 test_teardown_leaves_polytoken_layer_for_other_harnesses
 test_herdr_teardown_clears_escalation_marker
 test_herdr_flat_teardown_refuses_orphaning_records_then_retry_completes
+test_herdr_flat_teardown_leaves_foreign_occupant_open
+test_herdr_flat_teardown_refuses_unreadable_occupant
+test_herdr_flat_teardown_closes_occupant_below_its_copy
 test_herdr_flat_teardown_refuses_records_on_unparseable_presence
 test_herdr_flat_teardown_preflight_refuses_before_changes
 test_herdr_teardown_presentation_lock_namespace_is_per_account
 test_forced_secondmate_herdr_child_preflight_refuses_before_changes
 test_forced_secondmate_teardown_holds_descendant_lifecycle_locks
 test_forced_secondmate_herdr_child_retains_records_when_close_unconfirmed
+test_forced_secondmate_herdr_child_leaves_reassigned_slot_occupant_open
 test_forced_teardown_retains_nested_secondmate_home_when_grandchild_close_unconfirmed
 test_herdr_projection_teardown_retires_journal_only_after_confirmed_close
 test_herdr_projection_teardown_retains_journal_when_close_unconfirmed

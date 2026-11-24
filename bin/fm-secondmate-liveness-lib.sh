@@ -340,6 +340,20 @@ fm_secondmate_liveness_relaunch() {  # <meta> <id> [timeout-secs]
           home=$(fm_meta_get "$meta" home)
           [ -n "$home" ] || home=$(fm_meta_get "$meta" worktree)
           ( unset FM_ROOT_OVERRIDE; FM_HOME="$home" FM_ROOT="$home" STATE="$home/state" fm_backend_kill "$backend" "$target" ) 2>/dev/null || true
+        elif [ "$backend" = herdr ]; then
+          # The recorded pane id can host another occupant after a Herdr
+          # restart; the home proves the pane is still this secondmate's.
+          local herdr_owner
+          herdr_owner=$(fm_meta_get "$meta" home)
+          [ -n "$herdr_owner" ] || herdr_owner=$(fm_meta_get "$meta" worktree)
+          if ! fm_backend_kill "$backend" "$target" "" "" "$herdr_owner" 2>/dev/null; then
+            fm_secondmate_liveness_ledger_add "$id" failed || true
+            FM_SM_LIVE_STATUS=skipped
+            fm_lock_release "$relaunch_lock" || true
+            FM_SM_LIVE_REASON="could not prove who occupies the old $backend endpoint $target; it and its record are left in place, not replaced"
+            FM_SM_LIVE_RC=1
+            return 1
+          fi
         else
           fm_backend_kill "$backend" "$target" 2>/dev/null || true
         fi

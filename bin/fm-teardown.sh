@@ -3397,6 +3397,7 @@ teardown_herdr_require_prerequisites() {  # <task-id>
   for prerequisite in \
     fm_backend_herdr_parse_target \
     fm_backend_herdr_pane_presence_state \
+    fm_backend_herdr_pane_owner_state \
     fm_backend_herdr_workspace_presence_state \
     fm_backend_herdr_endpoint_confirmed_gone \
     fm_backend_herdr_explicit_close_pane_confirmed \
@@ -3545,8 +3546,20 @@ endpoint_close_refusal() {  # <subject> <backend> <target> <honors-force>
   return 1
 }
 
+# teardown_herdr_owner_state: fm_backend_herdr_pane_owner_state for a task's
+# recorded pane. A reassigned slot is another task's copy, so an occupant there
+# is that task's, never proof of the recording task's.
+teardown_herdr_owner_state() {  # <session> <pane> <owner-dir> <slot-reassigned 0|1>
+  local state
+  state=$(fm_backend_herdr_pane_owner_state "$1" "$2" "$3")
+  if [ "$4" = 1 ] && [ "$state" = owned ]; then
+    state=foreign
+  fi
+  printf '%s' "$state"
+}
+
 cleanup_firstmate_home_children() {
-  local home=$1 archive_parent=${2:-$ID} sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_rex_home child_backend child_orca_worktree_id child_return_rc child_busy_gen child_owner_rc child_pool_slot
+  local home=$1 archive_parent=${2:-$ID} sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_rex_home child_backend child_orca_worktree_id child_return_rc child_busy_gen child_owner_rc child_pool_slot child_owner_dir child_kill_rc child_slot_reassigned
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
@@ -3575,8 +3588,31 @@ cleanup_firstmate_home_children() {
           echo "error: herdr session presentation lock is not held for child $child_id; retaining that child's durable identity records and stopping forced cleanup" >&2
           return 1
         fi
-        fm_backend_herdr_kill_serialized "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE" 2>/dev/null || true
-        if ! fm_backend_herdr_endpoint_confirmed_gone "$child_t"; then
+        child_owner_dir=$child_wt
+        if [ "$child_kind" = secondmate ]; then
+          child_owner_dir=$(meta_value "$child_meta" home)
+          [ -n "$child_owner_dir" ] || child_owner_dir=$child_wt
+        fi
+        child_slot_reassigned=0
+        if [ "$child_kind" != secondmate ] && [ -n "$child_wt" ] \
+           && fm_treehouse_pool_slot "$child_proj" "$child_wt"; then
+          child_owner_rc=0
+          require_owned_worktree_slot_record "$child_id" "$child_wt" 2>/dev/null || child_owner_rc=$?
+          [ "$child_owner_rc" -ne "$TEARDOWN_SLOT_REASSIGNED_RC" ] || child_slot_reassigned=1
+        fi
+        child_kill_rc=0
+        case "$(teardown_herdr_owner_state "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE" "$child_owner_dir" "$child_slot_reassigned")" in
+          owned)
+            fm_backend_herdr_kill_serialized "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE" "$child_owner_dir" || child_kill_rc=$?
+            ;;
+          foreign)
+            echo "warning: herdr pane $child_t for child $child_id is now held by another occupant; leaving it open and treating that child's endpoint as already gone" >&2
+            child_kill_rc=3
+            ;;
+          gone) ;;
+          *) child_kill_rc=1 ;;
+        esac
+        if [ "$child_kill_rc" != 3 ] && ! fm_backend_herdr_endpoint_confirmed_gone "$child_t"; then
           echo "error: herdr pane $child_t for child $child_id is not confirmed gone; retaining that child's durable identity records and stopping forced cleanup" >&2
           return 1
         fi
@@ -3886,6 +3922,32 @@ teardown_herdr_journal_orphaned() {
     [ "$FM_BACKEND_HERDR_JOURNAL_SESSION:$FM_BACKEND_HERDR_JOURNAL_PANE_ID" = "$T" ]
   fi
 }
+# A recorded Herdr pane id names a pane object, not its occupant: after a Herdr
+# restart the same id can host something else, even this home's own firstmate
+# session. Close it only while fm_backend_herdr_pane_owner_state proves this
+# task still occupies it. A proven foreign occupant is left open and the task's
+# endpoint is treated as already released, so cleanup continues without it; an
+# occupant that cannot be read refuses here with every record intact.
+TEARDOWN_HERDR_PANE_RELEASED=0
+if [ "$BACKEND" = herdr ]; then
+  TEARDOWN_HERDR_OWNER_DIR=$WT
+  [ "$KIND" != secondmate ] || [ -z "$HOME_PATH" ] || TEARDOWN_HERDR_OWNER_DIR=$HOME_PATH
+  TEARDOWN_HERDR_SLOT_REASSIGNED=0
+  [ "$KIND" = secondmate ] || teardown_owns_worktree || TEARDOWN_HERDR_SLOT_REASSIGNED=1
+  TEARDOWN_HERDR_OWNER_STATE=$(teardown_herdr_owner_state "$TEARDOWN_HERDR_SESSION" \
+    "$TEARDOWN_HERDR_PANE" "$TEARDOWN_HERDR_OWNER_DIR" "$TEARDOWN_HERDR_SLOT_REASSIGNED")
+  case "$TEARDOWN_HERDR_OWNER_STATE" in
+    owned|gone) ;;
+    foreign)
+      TEARDOWN_HERDR_PANE_RELEASED=1
+      echo "warning: herdr pane $T is now held by an occupant that is not $ID (its live working directory is outside ${TEARDOWN_HERDR_OWNER_DIR}${TEARDOWN_SLOT_REASSIGNED_TO:+, or inside the slot task $TEARDOWN_SLOT_REASSIGNED_TO now holds}); leaving that pane open and treating $ID's endpoint as already gone" >&2
+      ;;
+    *)
+      echo "error: herdr pane $T for $ID is present but its occupant could not be proven to be $ID (${TEARDOWN_HERDR_OWNER_STATE}); leaving it open and retaining every durable task record - rerun teardown once Herdr reports the pane's live working directory" >&2
+      exit 1
+      ;;
+  esac
+fi
 HERDR_PRESENTATION_RETIRE_CANDIDATE=0
 HERDR_PRESENTATION_SESSION=
 HERDR_PRESENTATION_PANE=
@@ -3906,7 +3968,9 @@ if [ "$BACKEND" = herdr ] \
   fi
 fi
 
-if [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" = 1 ]; then
+if [ "$TEARDOWN_HERDR_PANE_RELEASED" = 1 ]; then
+  :
+elif [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" = 1 ]; then
   # The presentation lock was acquired above, before any destructive step; a
   # contended lock already refused this teardown while everything was intact.
   if teardown_herdr_session_lock_held "$HERDR_PRESENTATION_SESSION"; then
@@ -3931,7 +3995,9 @@ elif [ "$BACKEND" = herdr ]; then
   fi
 fi
 
-if [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" = 1 ]; then
+if [ "$TEARDOWN_HERDR_PANE_RELEASED" = 1 ]; then
+  :
+elif [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" = 1 ]; then
   if [ "$(fm_backend_herdr_pane_agent_state "$HERDR_PRESENTATION_SESSION" "$HERDR_PRESENTATION_PANE")" = dead ]; then
     rm -f "$HERDR_PRESENTATION_JOURNAL"
   else
@@ -3944,7 +4010,7 @@ fi
 # A refused or skipped Herdr close must stop before the reaper or Treehouse
 # return can end the pane shell in the task copy. Confirm the exact pane is gone
 # while the copy and every durable record are still intact.
-if [ "$BACKEND" = herdr ]; then
+if [ "$BACKEND" = herdr ] && [ "$TEARDOWN_HERDR_PANE_RELEASED" != 1 ]; then
   fm_backend_source herdr || true
   if ! declare -F fm_backend_herdr_endpoint_confirmed_gone >/dev/null 2>&1; then
     echo "error: herdr endpoint confirmation is unavailable for $ID; retaining every durable task record" >&2
@@ -4245,10 +4311,10 @@ rm -rf "$STATE/$ID.inbox" "$STATE/$ID.git-hooks" "$STATE/$ID.push-guard" \
   "$STATE/$ID.polytoken-config" \
   "$STATE/$ID.polytoken-sessions" "$STATE/$ID.polytoken-sessions-v1"
 # A presentation journal the close path left behind is orphaned once the
-# recorded pane is proven gone (the Herdr gate above) unless it still names a
-# live projected workspace - a version 2 binding of some other pane, or a
-# version 1 attempt whose token-bearing workspace is still present - which the
-# session-start sweep alone may judge (header).
+# recorded pane is proven gone or released to another occupant (the Herdr gate
+# above) unless it still names a live projected workspace - a version 2 binding
+# of some other pane, or a version 1 attempt whose token-bearing workspace is
+# still present - which the session-start sweep alone may judge (header).
 if [ -e "$HERDR_PRESENTATION_JOURNAL" ] || [ -L "$HERDR_PRESENTATION_JOURNAL" ]; then
   if teardown_herdr_journal_orphaned; then
     rm -f "$HERDR_PRESENTATION_JOURNAL"
