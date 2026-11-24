@@ -463,7 +463,9 @@ case "${1:-} ${2:-}" in
     if [ "$pane" = p-new ] && [ -e "$spawned" ]; then
       printf '%s\n' '{"result":{"pane":{"pane_id":"p-new","tab_id":"t-new","workspace_id":"ws1"}}}'
     elif [ "$pane" = p-old ] && [ ! -e "$killed" ]; then
-      printf '%s\n' '{"result":{"pane":{"pane_id":"p-old","tab_id":"t-old","workspace_id":"ws1"}}}'
+      # The husk's live foreground cwd is the secondmate home, the occupant
+      # proof a recorded-pane close requires.
+      printf '{"result":{"pane":{"pane_id":"p-old","tab_id":"t-old","workspace_id":"ws1","foreground_cwd":"%s"}}}\n' "${FM_FAKE_HERDR_OWNER_CWD:?}"
     else
       printf '%s\n' '{"error":{"code":"pane_not_found"}}' >&2
       exit 1
@@ -685,7 +687,7 @@ EOF
 run_session_start_herdr_secondmate() {
   local root=$1 home=$2 fakebin=$3 mate=$4 log=$5 state=$6
   FM_BACKEND=herdr FM_FAKE_HERDR_LOG="$log" FM_FAKE_HERDR_STATE="$state" \
-    FM_FAKE_SECOND_MATE_ID="$SESSION_START_HERDR_SECOND_MATE_ID" \
+    FM_FAKE_SECOND_MATE_ID="$SESSION_START_HERDR_SECOND_MATE_ID" FM_FAKE_HERDR_OWNER_CWD="$mate" \
     FM_FAKE_HARNESS_PID=$$ \
     run_session_start "$home" "$root" "$fakebin:$BASE_PATH"
 }
