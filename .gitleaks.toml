@@ -1,0 +1,25 @@
+# Gitleaks configuration for the secret-scan workflow
+# (.github/workflows/secret-scan.yml): the default ruleset plus exact
+# allowances for deliberately fake test-fixture values that the generic-api-key
+# rule reports. Each entry is pinned to one literal in one file, so a real key
+# anywhere else, or a different value in the same file, is still reported.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Fake quota-API key fixture asserting the key never reaches argv"
+condition = "AND"
+paths = ['''^tests/fm-dispatch-resolve\.test\.sh$''']
+regexes = ['''^test-key-9f1c2d3e-never-on-argv$''']
+
+[[allowlists]]
+description = "Fake keychain secret fixture asserting the secret never reaches argv"
+condition = "AND"
+paths = ['''^tests/fm-dispatch-resolve\.test\.sh$''']
+regexes = ['''^kc-effective-c07e5a12-never-on-argv$''']
+
+[[allowlists]]
+description = "Fake inherited-git-config secret asserting spawn never writes it"
+condition = "AND"
+paths = ['''^tests/fm-backend-t3code\.test\.sh$''']
+regexes = ['''^fm-inherited-secret-7f3a$''']
