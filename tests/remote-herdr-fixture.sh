@@ -12,6 +12,9 @@
 # tab's only pane closes the tab, and agent get reports agent_not_found for a
 # pane no agent has registered on.
 #
+# `pane get` reports a pane's launch directory as its live foreground_cwd, the
+# occupant signal bin/backends/herdr.sh requires before closing a recorded pane.
+#
 # Beyond that it models the pane IO a real launch performs. A pane reports a
 # registered agent once anything has been typed into it, and submitting starts
 # one turn: the next agent read reports working and the pane settles back to
@@ -83,7 +86,14 @@ case "${1:-} ${2:-}" in
     if [ "$(jq_state -r --arg p "$pane" '[.tabs[]|select(.pane_id==$p)]|length')" = 0 ]; then
       printf '{"error":{"code":"pane_not_found","message":"%s"}}\n' "$pane"
     else
-      printf '{"result":{"pane":{"pane_id":"%s"}}}\n' "$pane"
+      # A pane's live foreground cwd is where it was launched (its tab's --cwd,
+      # else its workspace's), the occupant proof a recorded-pane close needs.
+      jq_state -c --arg p "$pane" '
+        (first(.tabs[]|select(.pane_id==$p))) as $t
+        | ($t.cwd // "") as $tc
+        | (if $tc != "" then $tc
+           else (first(.workspaces[]|select(.workspace_id==$t.workspace_id)|.cwd) // "") end) as $fg
+        | {result:{pane:({pane_id:$p} + (if $fg != "" then {foreground_cwd:$fg} else {} end))}}'
     fi
     ;;
   "pane close")
